@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.2"
+CONFIG="${HOME}/.ripe_poem"
+WHOIS="${WHOIS:-/usr/bin/whois}"
+WHOIS_HOST="whois.ripe.net"
+RUN_EDIT=1
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+ripe-poem - create and submit RIPE poem objects
+
+Usage:
+  ripe-poem [-h]
+
+On first run, configuration will be created in:
+  ${CONFIG}
+EOF
+}
+
+need_exec() {
+    command -v "$1" >/dev/null 2>&1 || die "Required program not found: $1"
+}
+
+# Pad text ($1: string to pad; $2: integer padding-length, positive for left-padding, negative for right-padding):
+pad () { [ "$#" -gt 1 ] && [ -n "$2" ] && printf "%$2.${2#-}s" "$1"; }
+
+h_line () {
+  printf '=%.0s' {1..60}
+  echo
+}
+
+get_prompt () {
+    local PROMPT_TEXT=$1
+    local PROMPT_DEFAULT=${2-}
+
+    local prompt
+    prompt="$( pad "${PROMPT_TEXT}" -30 ) : "
+
+    if [ "${#PROMPT_DEFAULT}" -eq 1 ]; then
+        read -r -n 1 -p "$prompt" REPLY
+    else
+        local def="$PROMPT_DEFAULT"
+        read -r -e -p "$prompt" -i "$def" REPLY
+    fi
+
+    REPLY=${REPLY:-$PROMPT_DEFAULT}
+    REPLY=${REPLY//$'\n'/}
+
+    # Only lowercase if default is exactly 1 character
+    if [ "${#PROMPT_DEFAULT}" -eq 1 ]; then
+        printf '%s\n' "${REPLY,,}"
+    else
+        printf '%s\n' "$REPLY"
+    fi
+}
+
+create_default_config() {
+
+  RUN_EDIT=0
+  SENDMAIL_ARGS='-t'
+
+  GPG=$(command -v gpg)
+  GPG_ARGS='--batch --yes'
+
+  EDITOR=${EDITOR:=/usr/bin/nano}
+
+    if command -v neomutt >/dev/null 2>&1; then
+        SENDMAIL=$(command -v neomutt)
+        SENDMAIL_ARGS=''
+    elif command -v sendmail >/dev/null 2>&1; then
+        SENDMAIL=$(command -v sendmail)
+    elif command -v msmtp >/dev/null 2>&1; then
+        SENDMAIL=$(command -v msmtp)
+    else
+        echo "neomutt, sendmail nor msmtp found - you need to edit ${CONFIG}"
+        SENDMAIL='/usr/sbin/sendmail'
+    fi
+
+    h_line
+    echo "==> First run: creating config ${CONFIG}"
+    echo
+    AUTHOR=$( get_prompt "RIPE handle for author" 'XXXX-RIPE')
+    EMAIL=$( get_prompt "Sender email" 'you@example.com')
+    TO=$( get_prompt "Submission email" 'auto-dbm@ripe.net')
+    echo
+    EDITOR=$( get_prompt "Your poem editor" ${EDITOR} )
+    EDITOR_ARGS=$( get_prompt "Args for ${EDITOR}" '--saveonexit' )
+    echo
+    GPG=$( get_prompt "gpg path" ${GPG} )
+    GPG_ARGS=$( get_prompt "Args for ${GPG}" "${GPG_ARGS}" )
+    echo
+    SENDMAIL=$( get_prompt "mail program to use" ${SENDMAIL} )
+    SENDMAIL_ARGS=$( get_prompt "Args for ${SENDMAIL}" "${SENDMAIL_ARGS}" )
+    echo
+    h_line
+
+    writeconf=$( get_prompt "==> Write config? [Y/n]"   Y )
+
+    [ "$writeconf" = "y" ] || { echo; echo "exiting - NOT saved"; exit 1; }
+   
+    cat >"${CONFIG}" <<EOF
+AUTHOR='${AUTHOR}'
+EMAIL='${EMAIL}'
+TO='${TO}'
+MNTNER='LIM-MNT'
+FORM='FORM-LIMERICK'
+
+GPG='${GPG}'
+GPG_ARGS='${GPG_ARGS}'
+
+EDITOR='${EDITOR}'
+EDITOR_ARGS='${EDITOR_ARGS}'
+
+SENDMAIL='${SENDMAIL}'
+SENDMAIL_ARGS='${SENDMAIL_ARGS}'
+EOF
+
+    chmod 600 "${CONFIG}"
+
+    echo
+    echo "Config written to ${CONFIG}"
+    echo "You can edit this file to change defaults."
+    echo
+}
+
+load_config() {
+    [ -f "${CONFIG}" ] || create_default_config
+
+    source "${CONFIG}"
+
+    : "${AUTHOR:?AUTHOR missing in config}"
+    : "${EMAIL:?EMAIL missing in config}"
+    : "${TO:?TO missing in config}"    
+    : "${MNTNER:?MNTNER missing in config}"
+
+    : "${GPG:=/usr/bin/gpg}"
+    : "${GPG_ARGS:=--batch --yes}"
+    : "${EDITOR:=/usr/bin/nano}"
+    : "${EDITOR_ARGS:=--saveonexit}"
+    : "${SENDMAIL:=/usr/sbin/sendmail}"
+}
+
+ensure_gnupg_perms() {
+    mkdir -p "${HOME}/.gnupg"
+    chmod 700 "${HOME}/.gnupg"
+}
+
+extract_auth_key() {
+    "$WHOIS" -h "$WHOIS_HOST" "$MNTNER" \
+        | awk '/^auth:[[:space:]]+PGPKEY-/ {print $2; exit}'
+}
+
+extract_fingerprint() {
+    awk '
+        BEGIN{IGNORECASE=1}
+        /^fingerpr:/ {
+            $1="";
+            sub(/^[[:space:]]+/, "", $0);
+            gsub(/[[:space:]]+/, "", $0);
+            print;
+            exit
+        }
+    '
+}
+
+extract_private_key() {
+    awk '
+        $1=="remarks:" {
+            sub(/^remarks:[[:space:]]*/, "", $0)
+            print
+        }
+    ' | awk '
+        /BEGIN PGP PRIVATE KEY BLOCK/ {inblk=1}
+        inblk {print}
+        /END PGP PRIVATE KEY BLOCK/ {exit}
+    '
+}
+
+
+ensure_keys() {
+
+    key=$(extract_auth_key)
+    [ -n "$key" ] || die "No PGPKEY found in ${MNTNER}"
+
+    echo "Using auth key-cert: ${key}"
+
+    keycert=$("$WHOIS" -h "$WHOIS_HOST" "$key")
+
+    fpr=$(echo "$keycert" | extract_fingerprint)
+    [ -n "$fpr" ] || die "No fingerprint found"
+
+    echo "Fingerprint: ${fpr}"
+
+    # Public key: only import if we don't already have it
+    if "$GPG" $GPG_ARGS --list-keys "$fpr" >/dev/null 2>&1; then
+        echo "Public key already present."
+    else
+        echo "Importing public key"
+        printf '%s\n' "$keycert" \
+          | sed -n 's/^certif:[[:space:]]*//p' \
+          | "$GPG" $GPG_ARGS --import
+    fi
+
+    # Private key: only import if we don't already have the secret key
+    if "$GPG" $GPG_ARGS --list-secret-keys "$fpr" >/dev/null 2>&1; then
+        echo "Private key already present."
+    else
+        # Only try if the key-cert actually contains a private key block in remarks:
+        if printf '%s\n' "$keycert" | grep -q '^remarks:.*BEGIN PGP PRIVATE KEY BLOCK'; then
+            echo "Importing private key from key-cert remarks:"
+            printf '%s\n' "$keycert" \
+              | sed -n 's/^remarks:[[:space:]]*//p' \
+              | sed -n '/^-----BEGIN PGP PRIVATE KEY BLOCK-----$/,/^-----END PGP PRIVATE KEY BLOCK-----$/p' \
+              | "$GPG" $GPG_ARGS --import
+            echo "Private key imported."
+        else
+            echo "No private key block found in key-cert remarks:."
+        fi
+    fi
+
+    SIGNING_FPR="$fpr"
+}
+
+
+sign_file() {
+    infile="$1"
+    outfile="$2"
+    "$GPG" $GPG_ARGS --armor --local-user "$SIGNING_FPR" \
+        --clearsign --output "$outfile" "$infile"
+}
+
+verify_file() {
+    file="$1"
+    "$GPG" $GPG_ARGS --verify "$file"
+}
+
+test_gpg() {
+    testfile=$(mktemp)
+    sigfile=$(mktemp)
+
+    echo "RIPE poem test $(date -u)" >"$testfile"
+
+    sign_file "$testfile" "$sigfile"
+
+    if verify_file "$sigfile"; then
+        rm -f "$testfile" "$sigfile"
+        echo "==> GPG sign/verify test passed."
+        return 0
+    else
+        echo "*** GPG sign/verify test FAILED."    
+        rm -f "$testfile" "$sigfile"
+        return 1
+    fi
+}
+
+
+create_template() {
+    cat >"$1" <<EOF
+poem: POEM-
+descr: 
+text: 
+text: 
+text: 
+text: 
+text: 
+text: 
+remarks: 
+remarks: 
+form: ${FORM}
+author: ${AUTHOR}
+mnt-by: ${MNTNER}
+source: RIPE
+EOF
+}
+
+
+poem_attr() {
+    # Args: file attribute (file "-" reads stdin); prints each value on its own line
+    awk -v attr="$2" '
+        tolower($1) == attr":" {
+            $1="";
+            sub(/^[[:space:]]+/, "", $0);
+            print
+        }
+    ' "$1"
+}
+
+check_poem_name() {
+    # Args: poem_file
+    # Returns 1 if a poem with the same name exists with a different author
+    local name existing new_authors old_authors
+
+    name=$(poem_attr "$1" poem | head -n 1)
+    case "$name" in ""|[Pp][Oo][Ee][Mm]-) return 0 ;; esac
+
+    existing=$("$WHOIS" -h "$WHOIS_HOST" -r -T poem "$name" || true)
+    printf '%s\n' "$existing" | grep -qi '^poem:' || return 0
+
+    new_authors=$(poem_attr "$1" author | tr '[:lower:]' '[:upper:]' | sort -u)
+    old_authors=$(printf '%s\n' "$existing" | poem_attr - author | tr '[:lower:]' '[:upper:]' | sort -u)
+
+    if [ -n "$new_authors" ] && printf '%s\n' "$old_authors" | grep -qxF -f <(printf '%s\n' "$new_authors"); then
+        return 0
+    fi
+
+    echo
+    echo "WARNING: ${name} already exists with a different author."
+    echo "  Existing author: $(echo $old_authors)"
+    echo "  Your author:     $(echo $new_authors)"
+    echo "If you send it, you change the poem of another author."
+    echo
+    return 1
+}
+
+abandon_poem() {
+    rm -f "$1"
+    echo
+    echo "Poetry abandoned! :("
+    exit 0
+}
+
+send_message() {
+    # Args: body_file subject to from
+    local body_file="$1"
+    local subject="$2"
+    local to="$3"
+    local from="$4"
+
+    if echo "$SENDMAIL" | grep -qi 'neomutt'; then
+
+        "$SENDMAIL" $SENDMAIL_ARGS \
+            -e "set from='${from}'" \
+            -e "unset record" \
+            -c "${from}" \
+            -s "$subject" \
+            -- "$to" < "$body_file"
+    else
+        {
+            echo "To: $to"
+            echo "From: $from"
+            echo "Subject: $subject"
+            echo "Cc: $from"
+            echo
+            cat "$body_file"
+        } | "$SENDMAIL" $SENDMAIL_ARGS
+    fi
+}
+
+
+main() {
+
+    [ "${1:-}" = "-h" ] && usage && exit 0
+
+    load_config
+
+    need_exec "$WHOIS"
+    need_exec "$GPG"
+    need_exec "$SENDMAIL"
+
+    if [ $RUN_EDIT -ne 1 ] ; then
+      echo "Config created. Check before running:"
+      h_line
+      echo "${CONFIG}:"
+      h_line
+      cat "${CONFIG}"
+      h_line
+      echo
+
+      do_pgp=$( get_prompt "==> Import pgp key? [Y/n]"   Y )
+      echo
+
+      if [ "$do_pgp" = "y" ] ; then
+         h_line
+         ensure_gnupg_perms
+         ensure_keys
+         test_gpg
+         exit 0
+      fi
+
+    exit 0
+
+    fi
+
+    ensure_gnupg_perms
+    ensure_keys
+    test_gpg || { echo; echo "gpg test failed"; exit 1; }
+
+    poemfile=$(mktemp)
+    create_template "$poemfile"
+
+    while true; do
+        "$EDITOR" $EDITOR_ARGS "$poemfile"
+        clear        
+        h_line
+        cat "$poemfile"
+        h_line
+    
+        ans=$( get_prompt "[E=Edit, S=Send, A=Abandon]?" 'e')
+    
+        case "$ans" in
+            e)
+                continue
+                ;;
+            s)
+                check_poem_name "$poemfile" && break
+                ans=$( get_prompt "[E=Edit, S=Send anyway, A=Abandon]?" 'e')
+                [ "$ans" = "s" ] && break
+                [ "$ans" = "a" ] && abandon_poem "$poemfile"
+                continue
+                ;;
+            a)
+                abandon_poem "$poemfile"
+                ;;
+            *)
+                # any junk input behaves like default edit
+                continue
+                ;;
+        esac
+    done
+
+    signed=$(mktemp)
+    sign_file "$poemfile" "$signed" 
+
+    send_message "$signed" "RIPE poem submission" "$TO" "$EMAIL"
+
+    rm -f "$poemfile" "$signed"
+    echo "Sent."
+
+}
+
+main "$@"
